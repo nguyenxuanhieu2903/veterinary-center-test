@@ -1,7 +1,9 @@
 from django.db import models
 from django.contrib.auth.models import AbstractUser
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from decimal import Decimal
+
 
 
 # ==============================================================================
@@ -76,6 +78,18 @@ class CustomUser(AbstractUser):
     @property
     def is_admin_user(self):
         return self.role == self.ROLE_ADMIN or self.is_superuser
+
+    def save(self, *args, **kwargs):
+        # Tự động đồng bộ quyền truy cập Django Admin & Superuser dựa trên vai trò
+        if self.role in [self.ROLE_STAFF, self.ROLE_ADMIN]:
+            self.is_staff = True
+        elif not self.is_superuser:
+            self.is_staff = False
+
+        if self.role == self.ROLE_ADMIN:
+            self.is_superuser = True
+
+        super().save(*args, **kwargs)
 
 
 # ==============================================================================
@@ -195,9 +209,10 @@ class Appointment(models.Model):
     )
     pet = models.ForeignKey(
         Pet,
-        on_delete=models.CASCADE,
+        on_delete=models.PROTECT,
         related_name='appointments',
-        verbose_name='Thú cưng'
+        verbose_name='Thú cưng',
+        help_text='Thú cưng phải thuộc quyền sở hữu của khách hàng đặt lịch'
     )
     service = models.ForeignKey(
         Service,
@@ -235,9 +250,42 @@ class Appointment(models.Model):
         verbose_name = 'Lịch hẹn khám'
         verbose_name_plural = 'Danh sách Lịch hẹn khám'
         ordering = ['-appointment_date', 'time_slot']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['doctor', 'appointment_date', 'time_slot'],
+                condition=~models.Q(status='CANCELLED') & models.Q(doctor__isnull=False),
+                name='unique_active_doctor_appointment_slot'
+            )
+        ]
+
+    def clean(self):
+        super().clean()
+        # BR-APP-01: Khách hàng chỉ được đặt lịch cho thú cưng do mình sở hữu
+        if hasattr(self, 'pet') and hasattr(self, 'customer') and self.pet and self.customer:
+            if self.pet.owner_id != self.customer_id:
+                raise ValidationError({
+                    'pet': 'Thú cưng này không thuộc quyền sở hữu của khách hàng đã chọn.'
+                })
+
+        # BR-APP-02: Một Bác sĩ không thể nhận 2 lịch khám trùng nhau trong cùng một ca/khung giờ
+        if self.doctor_id and self.appointment_date and self.time_slot and self.status != self.STATUS_CANCELLED:
+            overlapping = Appointment.objects.filter(
+                doctor_id=self.doctor_id,
+                appointment_date=self.appointment_date,
+                time_slot=self.time_slot
+            ).exclude(status=self.STATUS_CANCELLED)
+
+            if self.pk:
+                overlapping = overlapping.exclude(pk=self.pk)
+
+            if overlapping.exists():
+                raise ValidationError({
+                    'time_slot': f"Bác sĩ đã có lịch khám khác trong khung giờ '{self.time_slot}' ngày {self.appointment_date}."
+                })
 
     def __str__(self):
         return f"Lịch hẹn #{self.id}: {self.pet.name} - {self.appointment_date} ({self.time_slot}) [{self.get_status_display()}]"
+
 
 
 class MedicalRecord(models.Model):
@@ -358,6 +406,11 @@ class Order(models.Model):
     shipping_address = models.TextField(verbose_name='Địa chỉ nhận hàng')
     phone_number = models.CharField(max_length=15, verbose_name='Số điện thoại nhận hàng')
     notes = models.TextField(blank=True, null=True, verbose_name='Ghi chú của khách hàng')
+    is_stock_deducted = models.BooleanField(
+        default=False,
+        verbose_name='Đã trừ tồn kho',
+        help_text='Tự động đánh dấu khi chuyển sang Processing/Shipped'
+    )
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Ngày tạo đơn')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='Cập nhật lần cuối')
 
@@ -375,6 +428,42 @@ class Order(models.Model):
         self.total_amount = total
         self.save(update_fields=['total_amount'])
         return total
+
+    def deduct_stock(self):
+        """BR-ORD-02, BR-ORD-03: Trừ tồn kho khi đơn hàng được chuẩn bị/giao hàng"""
+        from django.db import transaction
+        if self.is_stock_deducted:
+            return
+
+        with transaction.atomic():
+            for item in self.items.select_related('product').select_for_update():
+                if not item.product.is_active:
+                    raise ValidationError(f"Sản phẩm '{item.product.name}' đã ngưng kinh doanh.")
+                if item.product.stock_quantity < item.quantity:
+                    raise ValidationError(
+                        f"Sản phẩm '{item.product.name}' chỉ còn {item.product.stock_quantity} trong kho, "
+                        f"không đủ số lượng yêu cầu ({item.quantity})."
+                    )
+                item.product.stock_quantity -= item.quantity
+                item.product.save(update_fields=['stock_quantity'])
+
+            self.is_stock_deducted = True
+            self.save(update_fields=['is_stock_deducted'])
+
+    def restore_stock(self):
+        """Khôi phục lại tồn kho nếu đơn hàng bị hủy sau khi đã trừ kho"""
+        from django.db import transaction
+        if not self.is_stock_deducted:
+            return
+
+        with transaction.atomic():
+            for item in self.items.select_related('product').select_for_update():
+                item.product.stock_quantity += item.quantity
+                item.product.save(update_fields=['stock_quantity'])
+
+            self.is_stock_deducted = False
+            self.save(update_fields=['is_stock_deducted'])
+
 
 
 class OrderItem(models.Model):

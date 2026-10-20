@@ -81,12 +81,27 @@ class OrderItemInline(admin.TabularInline):
 
 @admin.register(Order)
 class OrderAdmin(admin.ModelAdmin):
-    list_display = ('id', 'customer', 'total_amount', 'status', 'phone_number', 'created_at')
-    list_filter = ('status', 'created_at')
+    list_display = ('id', 'customer', 'total_amount', 'status', 'is_stock_deducted', 'phone_number', 'created_at')
+    list_filter = ('status', 'is_stock_deducted', 'created_at')
     search_fields = ('customer__username', 'shipping_address', 'phone_number')
     list_editable = ('status',)
+    readonly_fields = ('is_stock_deducted',)
     inlines = [OrderItemInline]
     autocomplete_fields = ('customer',)
+
+    def save_model(self, request, obj, form, change):
+        super().save_model(request, obj, form, change)
+        # Tự động trừ hoặc khôi phục tồn kho khi trạng thái đơn đổi trong Admin
+        if obj.status in [Order.STATUS_PROCESSING, Order.STATUS_SHIPPED] and not obj.is_stock_deducted:
+            try:
+                obj.deduct_stock()
+                self.message_user(request, f"Đã trừ tồn kho thành công cho Đơn hàng #{obj.id}.")
+            except Exception as e:
+                self.message_user(request, f"Lỗi trừ kho: {str(e)}", level='ERROR')
+        elif obj.status == Order.STATUS_CANCELLED and obj.is_stock_deducted:
+            obj.restore_stock()
+            self.message_user(request, f"Đã khôi phục tồn kho cho Đơn hàng #{obj.id}.")
+
 
 
 @admin.register(OrderItem)

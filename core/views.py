@@ -22,5 +22,7 @@ def health_check(request):
         'week': 'Week 1',
         'lead_role': 'TV1 - Leader / Core Backend & DevOps',
         'database': 'MySQL 8.0 Containerized',
+        'task_queue': 'Celery 5.x + Redis 7.x',
         'auth_model': 'core.CustomUser (4 roles: CUSTOMER, DOCTOR, STAFF, ADMIN)'
     })
+

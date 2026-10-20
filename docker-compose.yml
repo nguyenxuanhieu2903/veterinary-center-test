@@ -13,7 +13,7 @@ services:
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-vet_password123}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-vet_root_password123}
     ports:
-      - "3306:3306"
+      - "${HOST_DB_PORT:-3307}:3306"
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
@@ -57,6 +57,27 @@ services:
       redis:
         condition: service_healthy
 
+  celery:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vet_celery_worker
+    restart: unless-stopped
+    command: celery -A veterinary_center worker -l info
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=db
+      - DB_PORT=3306
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
 volumes:
   mysql_data:
     driver: local
+
